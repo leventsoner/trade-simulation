@@ -91,8 +91,89 @@ def max_drawdown(df, initial_balance):
     balance = pd.concat([pd.Series([initial_balance]), df['Balance']], ignore_index=True)
     return (balance / balance.cummax() - 1).min()
 
-def analyze_results(df, initial_balance, risk_per_trade):
-    """Print detailed trading statistics"""
+def expected_fee_r(fee_rate, risk_per_trade, stop_median, stop_sigma, max_leverage):
+    """
+    Expected fees per trade in R for the given stop distance distribution.
+    Fees in R = position * (1 - (1-fee)^2) / (balance * risk_per_trade), averaged over
+    a fixed sample of stop distances (separate generator, so the global seed is untouched)
+    """
+    stops = stop_median * np.exp(stop_sigma * np.random.default_rng(0).standard_normal(100_000))
+    leverage = np.minimum(risk_per_trade / stops, max_leverage)
+    return (1 - (1 - fee_rate) ** 2) * (leverage / risk_per_trade).mean()
+
+def edge_metrics(r_multiples, weights, fee_r):
+    """
+    Edge statistics for a set of outcomes in R (wins > 0, losses <= 0)
+
+    Parameters:
+    - r_multiples: outcome of each scenario / trade in R, before fees
+    - weights: probability of each outcome (normalized internally)
+    - fee_r: average fees per trade in R
+    """
+    r = np.asarray(r_multiples, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    w = w / w.sum()
+    wins = r > 0
+
+    win_rate = w[wins].sum()
+    gross_win = (w * r)[wins].sum()
+    gross_loss = -(w * r)[~wins].sum()
+    avg_win = gross_win / win_rate if win_rate > 0 else np.nan
+    avg_loss = gross_loss / (1 - win_rate) if win_rate < 1 else np.nan  # positive number
+
+    # Break-even win rate p solves: p * avg_win - (1 - p) * avg_loss - fees = 0
+    breakeven_gross = avg_loss / (avg_win + avg_loss)
+    breakeven_net = (avg_loss + fee_r) / (avg_win + avg_loss)
+
+    return {
+        'Win Rate': win_rate,
+        'Average Win (R)': avg_win,
+        'Average Loss (R)': -avg_loss,
+        'Expected Value, gross (R)': gross_win - gross_loss,
+        'Fees per Trade (R)': fee_r,
+        'Expected Value, net (R)': gross_win - gross_loss - fee_r,
+        'Profit Factor, gross': gross_win / gross_loss if gross_loss > 0 else np.inf,
+        'Break-even Win Rate, no fees': breakeven_gross,
+        'Break-even Win Rate, with fees': breakeven_net,
+        'Edge (win rate - break-even)': win_rate - breakeven_net,
+    }
+
+def scenario_edge_metrics(scenarios, fee_r):
+    """Edge statistics implied by the scenarios list (every loss is -1R)"""
+    loss_prob = 1 - sum(prob for prob, _ in scenarios)
+    r_multiples = [-1.0] + [rrr for _, rrr in scenarios]
+    weights = [loss_prob] + [prob for prob, _ in scenarios]
+    return edge_metrics(r_multiples, weights, fee_r)
+
+def simulated_edge_metrics(df, risk_per_trade):
+    """Edge statistics measured from simulated trades (trades capped by leverage risk less than 1R)"""
+    one_r = df['Start_Balance'] * risk_per_trade
+    return edge_metrics(df['Trade_PnL'] / one_r, np.ones(len(df)), (df['Fees_Paid'] / one_r).mean())
+
+def print_edge_metrics(assumed, simulated=None):
+    """Print edge statistics, optionally next to the values measured from a simulation"""
+    def fmt(name, value):
+        if 'Win Rate' in name:
+            return f"{value:.2%}"
+        if name.startswith('Edge'):
+            return f"{value * 100:+.2f} pts"
+        if name.startswith('Profit Factor'):
+            return f"{value:.2f}"
+        return f"{value:+.3f}R"
+
+    print(f"\n{'Edge Metrics':<32}{'Assumed':>12}" + (f"{'Simulated':>12}" if simulated else ""))
+    for name, value in assumed.items():
+        row = f"{name:<32}{fmt(name, value):>12}"
+        if simulated:
+            row += f"{fmt(name, simulated[name]):>12}"
+        print(row)
+
+def analyze_results(df, initial_balance, risk_per_trade, scenarios=None, fee_r=None):
+    """
+    Print detailed trading statistics.
+    If scenarios and fee_r (expected fees per trade in R) are given, the assumed edge
+    metrics are printed next to the ones measured from the simulated trades.
+    """
     total_trades = len(df)
     outcome_counts = df['Outcome'].value_counts()
     final_balance = df['Balance'].iloc[-1]
@@ -115,6 +196,9 @@ def analyze_results(df, initial_balance, risk_per_trade):
     print(f"Total Return: {((final_balance/initial_balance) - 1):.2%}")
     print(f"Total Fees Paid: ${total_fees:,.2f}")
     print(f"Max Drawdown: {max_drawdown(df, initial_balance):.2%}")
+
+    if scenarios is not None and fee_r is not None:
+        print_edge_metrics(scenario_edge_metrics(scenarios, fee_r), simulated_edge_metrics(df, risk_per_trade))
 
 
 # Example usage
@@ -151,7 +235,8 @@ sim_params = dict(
 results = simulate_trades(**sim_params)
 
 # Analyze and plot results
-analyze_results(results, INITIAL_ASSET, RISK_PER_TRADE)
+fee_r = expected_fee_r(FEE_RATE, RISK_PER_TRADE, STOP_MEDIAN, STOP_SIGMA, MAX_LEVERAGE)
+analyze_results(results, INITIAL_ASSET, RISK_PER_TRADE, scenarios, fee_r)
 
 
 
